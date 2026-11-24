@@ -1,0 +1,57 @@
+name: Build and deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 3.1.64
+
+      - name: Get WORLD source
+        run: git clone --depth 1 https://github.com/mmorise/World.git
+
+      - name: Build WASM
+        run: |
+          mkdir -p site
+          emcc -O3 -I World/src World/src/*.cpp wrapper.cpp -o site/world.js \
+            -sMODULARIZE=1 \
+            -sEXPORT_NAME=WorldModule \
+            -sALLOW_MEMORY_GROWTH=1 \
+            -sENVIRONMENT=web \
+            -sEXPORTED_FUNCTIONS=_malloc,_free,_world_f0_length,_world_fft_size,_world_analyze,_world_synthesize \
+            -sEXPORTED_RUNTIME_METHODS=HEAPF64
+
+      - name: Copy page
+        run: cp index.html site/index.html
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
