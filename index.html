@@ -40,6 +40,16 @@ canvas{width:100%;height:110px;display:block;border-radius:8px;background:var(--
 <div class="card">
   <h2>1. 녹음 파일 불러오기, 음절 나누기</h2>
   <input type="file" id="file" accept="audio/*">
+  <div class="slider" style="margin-top:10px">
+    <div class="top"><span>잡음 제거 강도 (선택)</span><span id="v_dn"></span></div>
+    <input type="range" id="dn" min="0" max="100" step="5" value="0">
+    <div class="sub">음절 사이 조용한 구간(0.5초 이상)에서 잡음을 자동으로 학습해서 뺍니다. 40~70%부터 들어 보세요. 너무 세면 물속에서 나는 소리가 됩니다.</div>
+  </div>
+  <button class="primary" id="btnDn">잡음 제거 적용</button>
+  <button id="btnAllRaw">원본 전체 듣기</button>
+  <button id="btnAllDn">정리본 전체 듣기</button>
+  <button id="btnStop">정지</button>
+  <button id="btnDnWav">정리본 WAV 저장</button>
   <div class="sub" style="margin-top:8px">대본 순서대로 음절 이름을 적어 주세요 (띄어쓰기로 구분)</div>
   <input type="text" id="labels" value="あ い う え お">
   <div class="slider" style="margin-top:8px">
@@ -55,7 +65,7 @@ canvas{width:100%;height:110px;display:block;border-radius:8px;background:var(--
     <input type="range" id="minlen" min="60" max="400" step="10" value="120">
   </div>
   <button class="primary" id="btnSplit">구획 나누기</button>
-  <button id="btnOrig">선택 음절 원본 재생</button>
+  <button id="btnOrig">선택 음절 듣기</button>
   <div id="splitInfo" class="sub"></div>
   <canvas id="wave"></canvas>
   <div id="chips" style="margin-top:6px"></div>
@@ -73,7 +83,7 @@ canvas{width:100%;height:110px;display:block;border-radius:8px;background:var(--
   <div id="sliders" style="margin-top:10px"></div>
   <label class="sub"><input type="checkbox" id="auto"> 슬라이더를 놓으면 자동 재생</label><br>
   <button class="primary" id="btnProc">변조 재생</button>
-  <button id="btnOrig2">원본 재생</button>
+  <button id="btnOrig2">변조 전 듣기</button>
   <button id="btnDl">변조 WAV 저장</button>
   <button id="btnReset">슬라이더 초기화</button>
 </div>
@@ -217,11 +227,105 @@ function encodeWav(y, fs) {
   }
   return new Uint8Array(buf);
 }
+// ---- 잡음 제거 ----
+const _fftTab = {};
+function fftTables(n) {
+  if (_fftTab[n]) return _fftTab[n];
+  const c = new Float64Array(n / 2), s = new Float64Array(n / 2);
+  for (let i = 0; i < n / 2; i++) { c[i] = Math.cos(2 * Math.PI * i / n); s[i] = -Math.sin(2 * Math.PI * i / n); }
+  return (_fftTab[n] = { c, s });
+}
+// 제자리 FFT (길이는 2의 거듭제곱)
+function fftInPlace(re, im, inverse) {
+  const n = re.length, tab = fftTables(n);
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) { let t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; }
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    const half = len >> 1, step = n / len;
+    for (let i = 0; i < n; i += len) {
+      for (let k = 0; k < half; k++) {
+        const wr = tab.c[k * step], wi = inverse ? -tab.s[k * step] : tab.s[k * step];
+        const a = i + k, b = a + half;
+        const vr = re[b] * wr - im[b] * wi, vi = re[b] * wi + im[b] * wr;
+        re[b] = re[a] - vr; im[b] = im[a] - vi;
+        re[a] += vr; im[a] += vi;
+      }
+    }
+  }
+  if (inverse) for (let i = 0; i < n; i++) { re[i] /= n; im[i] /= n; }
+}
+
+// 스펙트럼 감산 잡음 제거. 가장 조용한 프레임들에서 잡음 특성을 자동으로 학습한다.
+// strength: 0(없음) ~ 1(강함)
+function denoise(x, fs, strength) {
+  if (!(strength > 0)) return Float32Array.from(x);
+  const N = fs >= 32000 ? 2048 : 1024, H = N >> 2, bins = N / 2 + 1;
+  const win = new Float64Array(N);
+  for (let i = 0; i < N; i++) win[i] = Math.sqrt(0.5 - 0.5 * Math.cos(2 * Math.PI * i / N));
+  const padLen = x.length + 2 * N;
+  const xp = new Float64Array(padLen);
+  for (let i = 0; i < x.length; i++) xp[N + i] = x[i];
+  const nFrames = Math.floor((padLen - N) / H) + 1;
+
+  // 1) 프레임별 에너지 -> 가장 조용한 약 10%를 잡음 구간으로 사용
+  const en = new Float64Array(nFrames);
+  for (let f = 0; f < nFrames; f++) {
+    let s = 0; const st = f * H;
+    for (let i = 0; i < N; i++) { const v = xp[st + i]; s += v * v; }
+    en[f] = s;
+  }
+  const idx = [];
+  for (let f = 0; f < nFrames; f++) if (en[f] > 1e-10) idx.push(f);
+  idx.sort((a, b) => en[a] - en[b]);
+  const use = idx.slice(0, Math.max(8, Math.floor(idx.length * 0.1)));
+
+  const re = new Float64Array(N), im = new Float64Array(N);
+  const noise = new Float64Array(bins);
+  for (const f of use) {
+    const st = f * H;
+    for (let i = 0; i < N; i++) { re[i] = xp[st + i] * win[i]; im[i] = 0; }
+    fftInPlace(re, im, false);
+    for (let k = 0; k < bins; k++) noise[k] += Math.sqrt(re[k] * re[k] + im[k] * im[k]);
+  }
+  if (use.length) for (let k = 0; k < bins; k++) noise[k] /= use.length;
+
+  // 2) 전체 프레임에서 잡음 성분을 뺀다
+  const alpha = 3 * strength, beta = Math.pow(0.05, strength);   // 강도 1이면 최대 약 26dB 감쇠
+  const out = new Float64Array(padLen);
+  const g = new Float64Array(bins), gs = new Float64Array(bins), prev = new Float64Array(bins).fill(1);
+  for (let f = 0; f < nFrames; f++) {
+    const st = f * H;
+    for (let i = 0; i < N; i++) { re[i] = xp[st + i] * win[i]; im[i] = 0; }
+    fftInPlace(re, im, false);
+    for (let k = 0; k < bins; k++) {
+      const mag = Math.sqrt(re[k] * re[k] + im[k] * im[k]);
+      g[k] = mag > 1e-12 ? Math.max(beta, 1 - alpha * noise[k] / mag) : beta;
+    }
+    for (let k = 0; k < bins; k++) {            // 주파수·시간 방향으로 부드럽게 (물방울 소리 줄이기)
+      const a = g[k > 0 ? k - 1 : 0], c = g[k < bins - 1 ? k + 1 : bins - 1];
+      gs[k] = 0.7 * ((a + 2 * g[k] + c) / 4) + 0.3 * prev[k];
+      prev[k] = gs[k];
+    }
+    for (let k = 0; k < bins; k++) {
+      re[k] *= gs[k]; im[k] *= gs[k];
+      if (k > 0 && k < N / 2) { re[N - k] *= gs[k]; im[N - k] *= gs[k]; }
+    }
+    fftInPlace(re, im, true);
+    for (let i = 0; i < N; i++) out[st + i] += re[i] * win[i];
+  }
+  const y = new Float32Array(x.length);
+  for (let i = 0; i < x.length; i++) y[i] = out[N + i] / 2;
+  return y;
+}
 // ==== PURE-END ====
 
 const $ = id => document.getElementById(id);
 const tick = () => new Promise(r => setTimeout(r, 20));
-let M = null, ctx = null, audio = null, fs = 44100;
+let M = null, ctx = null, audio = null, rawAudio = null, fs = 44100;
 let segs = [], sel = -1, an = null, lastProc = null, curSrc = null;
 
 function msg(t) { $('msg').textContent = t || ''; }
@@ -300,9 +404,33 @@ $('file').addEventListener('change', guard(async e => {
     const ch = buf.getChannelData(c);
     for (let i = 0; i < buf.length; i++) mono[i] += ch[i] / buf.numberOfChannels;
   }
-  audio = mono; segs = []; sel = -1; an = null;
-  msg((buf.duration).toFixed(1) + '초, ' + fs + 'Hz 파일을 불러왔습니다. 구획 나누기를 눌러 주세요.');
+  audio = mono; rawAudio = mono; segs = []; sel = -1; an = null;
+  msg((buf.duration).toFixed(1) + '초, ' + fs + 'Hz 파일을 불러왔습니다. 잡음이 있으면 잡음 제거를 먼저 적용하고, 구획 나누기를 눌러 주세요.');
   draw(); renderChips();
+}));
+
+// ---------- 잡음 제거 ----------
+$('dn').addEventListener('input', () => { $('v_dn').textContent = $('dn').value + '%'; });
+$('v_dn').textContent = $('dn').value + '%';
+$('btnDn').addEventListener('click', guard(async () => {
+  if (!rawAudio) { msg('먼저 녹음 파일을 선택하세요.'); return; }
+  const s = +$('dn').value / 100;
+  msg('잡음 제거 중... (파일이 길면 시간이 걸립니다)');
+  await tick();
+  audio = s > 0 ? denoise(rawAudio, fs, s) : rawAudio;
+  an = null; $('anInfo').textContent = '';
+  draw();
+  msg(s > 0 ? '잡음 제거를 적용했습니다 (' + Math.round(s * 100) + '%). 원본/정리본 전체 듣기로 비교해 보세요. 분석은 정리본으로 진행됩니다.' : '원본으로 되돌렸습니다.');
+}));
+$('btnAllRaw').addEventListener('click', guard(() => { if (!rawAudio) { msg('먼저 녹음 파일을 선택하세요.'); return; } playArr(rawAudio); }));
+$('btnAllDn').addEventListener('click', guard(() => { if (!audio) { msg('먼저 녹음 파일을 선택하세요.'); return; } playArr(audio); }));
+$('btnStop').addEventListener('click', () => { if (curSrc) { try { curSrc.stop(); } catch (_) {} } });
+$('btnDnWav').addEventListener('click', guard(() => {
+  if (!audio) { msg('먼저 녹음 파일을 선택하세요.'); return; }
+  const blob = new Blob([encodeWav(audio, fs)], { type: 'audio/wav' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = 'cleaned.wav';
+  document.body.appendChild(a); a.click(); a.remove();
 }));
 
 // ---------- 구획 나누기 ----------
